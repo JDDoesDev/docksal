@@ -49,3 +49,4 @@ services:
     extends:
       file: ${HOME}/.docksal/stacks/services.yml
       service: solr
+    image: ${SOLR_IMAGE:-docksal/solr:1.0-solr4}

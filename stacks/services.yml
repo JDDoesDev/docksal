@@ -171,7 +171,7 @@ services:
   # Solr
   solr:
     hostname: solr
-    image: ${SOLR_IMAGE:-docksal/solr:1.0-solr4}
+    image: ${SOLR_IMAGE:-docksal/solr:7.5-2.0}
     volumes:
       - project_root:/var/www:ro,nocopy  # Project root volume (read-only)
     labels:
