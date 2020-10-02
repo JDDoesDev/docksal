@@ -1,5 +1,122 @@
 # Changelog
 
+## 1.14.1 (2020-07-20)
+
+### New software versions
+
+- fin v1.99.0
+
+### New features
+
+- Updated projects to include Drupal 9 boilerplate projects (#1385)
+
+### Changes and improvements
+
+- Reverted back to using IP binding for system services with VirtualBox/boot2docker
+  - Only use `0.0.0.0` for vhost-proxy and dns with Docker Desktop 2.2.0.0+ on Mac/Windows
+- Bump `REQUIREMENTS_DOCKER_DESKTOP` to 2.1.0.5
+  - This is the last version before networking regressions were introduced (#1268)
+- Split docker versions based on environment (Linux, Docker Desktop, Boo2docker)
+  - `REQUIREMENTS_DOCKER='19.03.9'` - this is the earliest version available for Ubuntu 20.04 (focal) LTS
+  - `REQUIREMENTS_DOCKER_DD='19.03.8'` - this is the latest version available with Docker Desktop
+  - `REQUIREMENTS_DOCKER_B2D='19.03.5'` - this is the final boot2docker version
+  - Removed `REQUIREMENTS_DOCKER_DEBIAN`
+- Better handling of `ID_LIKE` in `is_debian` (#1377)
+- Added "DOCKSAL: NETWORKING" sections in sysinfo …
+  - Replaced "DOCKSAL: DNS"
+  - Prints network config variables
+  - Added check for DNS resolution/connectivity from containers (and not only host)
+- Added dns settings for run-cli
+
+### Documentation
+
+- Updated versions in setup docs
+  - Added a note in setup docs about Docker Desktop version regressions
+
+
+## 1.14.0 (2020-07-15)
+
+### New software versions
+
+- fin v1.97.0
+- VirtualBox v6.1.10
+- docker v19.03.5 (v19.03.9 on Debian/Ubuntu)
+- docker-compose v1.26.0
+- Switched `vhost-proxy` to [docksal/vhost-proxy:1.6](https://github.com/docksal/service-vhost-proxy/releases/tag/v1.6.0)
+- Switched `cli` image to [docksal/cli:2.11-php7.3](https://github.com/docksal/service-cli/releases/tag/v2.11.0)
+
+### New features
+
+- Ubuntu 20.04 (focal) LTS support
+- PHP 7.4 ([docksal/cli:2.11-php7.4](https://github.com/docksal/service-cli/releases/tag/v2.11.0))
+- Xhprof integration (#1270)
+- Project autostart switch (#1285)
+
+### Changes and improvements
+
+- Added `DOCKSAL_DNS_DISABLED` global config switch to allow disabling the build-in `docksal-dns` service (#1376)
+  - Use this as a transition to the new `docksal.site` base domain for projects
+  - Helps address the DNS port binding issue on macOS (`listen udp 0.0.0.0:53: bind: address already in use`)
+- Added proxy variables to `fin run-cli` (#1252)
+- Passing the database argument when running `fin db cli` (#1263)
+- Changed uuid generation method (#1287)
+- Added a check that the VM IP matches what we expect
+- Fixed issue "error while removing network: network id has active endpoints" (#1293)
+- Fixed environment variables for `fin exec` running scripts (#1289)
+- Fixed issue with starting `cli` from `vhost-proxy` and missing ssh agent socket (#1291)
+- Fixed logic with `SSH_AUTH_SOCKET` (#1308)
+- Allow overriding `DOCKSAL_DNS_DOMAIN` with Docker Desktop 2.2.0.0+
+  - If users want to stick with the `.docksal` TLD on Docker Desktop for Windows, they can do so by manually pinning `DOCKSAL_DNS_DOMAIN` (`fin config set --global DOCKSAL_DNS_DOMAIN=docksal`) and then use `fin hosts add project.docksal` to manage DNS records using the OS hosts file.
+- Added logging settings for system containers (#1354)
+
+### Documentation
+
+- Added a section for locally-trusted HTTPS certs using `mkcert` (#1370)
+- Explained SSH agent proxy functionality (#1253)
+- Added a section for xhprof (#1270)
+- Updated NFS mounts and configuration (#1261)
+- Added troubleshooting docs for NFS issues on macOS Catalina (#1371)
+- PostreSQL support in stacks (#564)
+- Configuration information for Nginx
+- Lots minor fixes in docs
+- ElasticSearch persistent settings
+- Docker container logging
+- Adding a custom certificate for a project (#1359)
+- Accessing environment variables in cron jobs (#1365)
+- Updated DNS settings docs (#1376)
+
+
+## 1.13.3 (2020-05-14)
+
+### New software versions
+
+- fin v1.95.0
+
+### Changes and improvements
+
+- Docker Desktop 2.3.0.2 compatibility fixes (Mac and Windows)
+  - Bind system services to `0.0.0.0` by default in virtualized environments (fixes #1268, fixes #1342)
+  - Dropped the dependency on DockerNAT interface on Windows (fixes #1276) 
+    - Do not configure DNS resolver with Docker Desktop for Windows
+    - Use the external `docksal.site` TLD with Docker Desktop for Windows v2.2.0.0+. This is necessary to have a working setup out of the box without the need to ask the user to manually configure DNS records using "fin hosts".
+
+### Experimental
+
+- Try the new external TDL for your Docksal projects!
+    ```
+    fin config set --global DOCKSAL_DNS_DOMAIN=docksal.site
+    ```
+    Note: This option is enforced with Docker Desktop for Windows 2.2.0.0+
+
+
+## 1.13.2 (2019-03-15)
+
+### Documentation
+
+- Added a section about setting/checking `DOCKSAL_VOLUMES` (#1275, #1296)
+- Added warnings in install docs about Docker Desktop versions (#1268)
+
+
 ## 1.13.1 (2019-12-17)
 
 ### New software versions
