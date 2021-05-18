@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-FIN_VERSION=1.99.0
+FIN_VERSION=1.103.0
 
 if [[ "$TERM" != "dumb" ]]; then
 	# Console colors
@@ -136,20 +136,20 @@ wsl_path ()
 DOCKSAL_VERSION="${DOCKSAL_VERSION:-master}"
 
 # Dependency versions
-REQUIREMENTS_DOCKER='19.03.9'  # This is the earliest version available for Ubuntu 20.04 (focal) LTS
-REQUIREMENTS_DOCKER_DD='19.03.8'  # This is the latest version available with Docker Desktop
+REQUIREMENTS_DOCKER='19.03.13'  # This is the earliest version available for Ubuntu 20.04 (focal) LTS
+REQUIREMENTS_DOCKER_DD='19.03.13'  # Ships with Docker Desktop 2.5.0.1 (49550)
 REQUIREMENTS_DOCKER_B2D='19.03.5'  # This is the final boot2docker version
-REQUIREMENTS_DOCKER_COMPOSE='1.26.0'
+REQUIREMENTS_DOCKER_COMPOSE='1.27.4'
 REQUIREMENTS_DOCKER_MACHINE='0.16.2'
-REQUIREMENTS_VBOX='6.1.10'  # Remember to update the download URLs below
+REQUIREMENTS_VBOX='6.1.16'  # Remember to update the download URLs below
 REQUIREMENTS_WINPTY='0.4.3'
 REQUIREMENTS_WINPTY_CYGWIN='2.8.0'
-REQUIREMENTS_DOCKER_DESKTOP='2.1.0.5'  # This is the last version before networking regressions were introduced (#1268)
+REQUIREMENTS_DOCKER_DESKTOP='2.5.0.1'  # This is the last version before networking regressions were introduced (#1268)
 
 # VirtualBox download URLs
 # Remember to update REQUIREMENTS_VBOX above
-URL_VBOX_MAC="https://download.virtualbox.org/virtualbox/6.1.10/VirtualBox-6.1.10-138449-OSX.dmg"
-URL_VBOX_WIN="https://download.virtualbox.org/virtualbox/6.1.10/VirtualBox-6.1.10-138449-Win.exe"
+URL_VBOX_MAC="https://download.virtualbox.org/virtualbox/6.1.16/VirtualBox-6.1.16-140961-OSX.dmg"
+URL_VBOX_WIN="https://download.virtualbox.org/virtualbox/6.1.16/VirtualBox-6.1.16-140961-Win.exe"
 
 # Configuration paths
 # Rewrite $HOME on windows to be absolute path in Unix notation
@@ -279,12 +279,18 @@ else
 	DOCKSAL_SSH_AGENT_USE_HOST="${DOCKSAL_SSH_AGENT_USE_HOST:-0}"
 fi
 
-# Healthcheck timeout
+# Project healthcheck timeout
+# Total time (seconds) before the _project_ healthcheck is considered failed
 DOCKSAL_HEALTHCHECK_TIMEOUT=${DOCKSAL_HEALTHCHECK_TIMEOUT:-60}
 
-# Logging settings
+# Container Logging settings
 DOCKSAL_CONTAINER_LOG_MAX_SIZE=${DOCKSAL_CONTAINER_LOG_MAX_SIZE:-1m}
 DOCKSAL_CONTAINER_LOG_MAX_FILE=${DOCKSAL_CONTAINER_LOG_MAX_FILE:-10}
+
+# Container healthcheck settings
+# Default health-interval option for all containers
+# Note: Setting this too low (<5s) will result in a considerable load with lots of running containers (20+)
+DOCKSAL_CONTAINER_HEALTHCHECK_INTERVAL=${DOCKSAL_CONTAINER_HEALTHCHECK_INTERVAL:-10s}
 
 #---------------------------- URL references --------------------------------
 GITHUB_API="https://api.github.com"
@@ -310,6 +316,7 @@ URL_REPO_SYMFONY_WEBAPP="https://github.com/docksal/boilerplate-symfony-webapp.g
 URL_REPO_BACKDROP="https://github.com/docksal/boilerplate-backdrop.git"
 URL_ADDONS_HOSTING="https://raw.githubusercontent.com"
 URL_ADDONS_REPO="$URL_ADDONS_HOSTING/docksal/addons"
+STACKS_OVERRIDES_DD_BIND="overrides-dd-bind.yml"
 STACKS_OVERRIDES_IDE="overrides-ide.yml"
 STACKS_OVERRIDES_XHPROF="overrides-xhprof.yml"
 STACKS_SERVICES="services.yml"
@@ -445,32 +452,48 @@ docker-compose ()
 		COMPOSE_FILE="${docksal_yml_file}${SEPARATOR}${COMPOSE_FILE}"
 	fi
 
-	# By default, we use the built-in SSH agent unless DOCKSAL_SSH_AGENT_USE_HOST=1
-	# On Linux, we can directly mount the SSH auth socket into the container.
-	# On Mac/Win, we proxy the Unix socket through TCP on Docksal's host IP.
+	# By default, we use the built-in docksal-ssh-agent unless DOCKSAL_SSH_AGENT_USE_HOST=1
+	# To use host's ssh-agent on Linux, we can directly mount the SSH auth socket into the container.
+	# To use host's ssh-agent on on Mac/Win, we proxy the Unix socket through TCP on DOCKSAL_IP.
 	if ! is_linux || [[ "$DOCKSAL_SSH_AGENT_USE_HOST" != "1" ]]; then
 		unset SSH_AUTH_SOCK
 	fi
 
-	# always create directory for socket
-	export SSH_AUTH_SOCK_DIR="$CONFIG_DIR/tmp/${COMPOSE_PROJECT_NAME_SAFE}"
-	mkdir -p "$SSH_AUTH_SOCK_DIR"
-
-	# Create original socket copy (hardlink) and update SSH_AUTH_SOCK with new socket path
-	if [[ "${SSH_AUTH_SOCK}" != "" ]]; then
+	# Create a "shadow" ssh-agent socket for cli on a Linux server (used for ssh-agent forwarding)
+	# This "black magic" is necessary to avoid issues with ssh-agent forwarding on Linux sandbox servers.
+	# Without this, cli container would start with a forwarded ssh-agent socket mounted from an admin or docksal/ci-agent
+	# session. When the session is disconnected, the mounted socket would be removed, which makes the mount invalid and
+	# thus results in a broken stack when vhost-proxy attempts to start a stopped project.
+	# docksal/vhost-proxy operates with docker commands and cannot update config for containers in the stack automatically.
+	if is_ci && [[ "${SSH_AUTH_SOCK}" != "" ]]; then
+		# Derive a custom ssh-agent socket path from the original value
+		# The socket must reside on the same volume or we'll get "Invalid cross-device link"
+		# Example: SSH_AUTH_SOCK=/tmp/ssh-KweeHCNAIt/agent.1909 => SSH_AUTH_SOCK_DIR /tmp/.docksal/project
+		export SSH_AUTH_SOCK_DIR="/$(echo ${SSH_AUTH_SOCK} | cut -d'/' -f2)/.docksal/${COMPOSE_PROJECT_NAME_SAFE}"
+		# Create socket directory under the current user, otherwise docker will create as root, which will case issues
+		mkdir -p "$SSH_AUTH_SOCK_DIR"
+		# Fix permissions in cases when the volume directory has been already created by docker (root user)
+		[[ ! -O "$SSH_AUTH_SOCK_DIR" ]] && sudo chown $(id -u):$(id -g) "$SSH_AUTH_SOCK_DIR"
 		# find project ssh sockets and delete unused
-		for SOCK in $(find $SSH_AUTH_SOCK_DIR -type s)
-		do
-		    # remove unused socket
-		    (SSH_AUTH_SOCK=${SOCK} && ssh-add -L >/dev/null 2>&1) || rm -f ${SOCK}
+		for socket in $(find ${SSH_AUTH_SOCK_DIR} -type s); do
+			# Remove unused socket
+			(SSH_AUTH_SOCK=${socket} && ssh-add -L >/dev/null 2>&1) || rm -f ${socket}
 		done
-		AGENT_ID=$(basename $SSH_AUTH_SOCK)
-		# skip creation socket copy if already exists
-		if [[ ! -S $SSH_AUTH_SOCK_DIR/$AGENT_ID ]]
+		AGENT_ID=$(basename ${SSH_AUTH_SOCK})
+		# Create socket link unless one already exits
+		if [[ ! -S "$SSH_AUTH_SOCK_DIR/$AGENT_ID" ]]
 		then
-		    ln -f $SSH_AUTH_SOCK $SSH_AUTH_SOCK_DIR/$AGENT_ID
-		    export SSH_AUTH_SOCK="$SSH_AUTH_SOCK_DIR/$AGENT_ID"
+			ln -f ${SSH_AUTH_SOCK} "$SSH_AUTH_SOCK_DIR/$AGENT_ID"
 		fi
+		# Override ssh-agent socket with out shadow copy
+		export SSH_AUTH_SOCK="$SSH_AUTH_SOCK_DIR/$AGENT_ID"
+	else
+		# When there's no SSH_AUTH_SOCK, we have to provide a dummy SSH_AUTH_SOCK_DIR,
+		# otherwise cli will have an invalid volume definition (see stacks/services.yml:cli)
+		export SSH_AUTH_SOCK_DIR="/tmp/.docksal/${COMPOSE_PROJECT_NAME_SAFE}"
+		mkdir -p "$SSH_AUTH_SOCK_DIR"
+		# Fix permissions in cases when the volume directory has been already created by docker (root user)
+		[[ ! -O "$SSH_AUTH_SOCK_DIR" ]] && sudo chown $(id -u):$(id -g) "$SSH_AUTH_SOCK_DIR"
 	fi
 
 	# Call regular docker-compose.
@@ -889,11 +912,11 @@ testing_warn ()
 		echo-yellow "[!] Using Docksal version: ${DOCKSAL_VERSION}"
 }
 
-# Convert version string like 1.2.3 to integer for comparison
-# param $1 version string of 3 components max (e.g., 1.10.3)
+# Convert version string like 1.2.3.4 to integer for comparison
+# param $1 version string of 4 components max (e.g., 1.10.3.0)
 ver_to_int ()
 {
-	echo "$@" | awk -F. '{ printf("%d%03d%03d", $1,$2,$3); }'
+	echo "$@" | awk -F. '{ printf("%d%03d%03d%03d", $1,$2,$3,$4); }'
 }
 
 #---------------------------- Control functions -------------------------------
@@ -924,7 +947,7 @@ check_docker_server_version ()
 	if ! is_docker_server_version; then
 		# Since we do not control Docker Desktop, ask user to update manually when necessary
 		if is_docker_native; then
-			echo-alert "Please update Docker Desktop to the latest version manually." \
+			echo-alert "Please update Docker Desktop manually." \
 				"Expected Docker Desktop version: ${REQUIREMENTS_DOCKER_DESKTOP}"
 		else
 			echo-alert "Required Docker server version is $REQUIREMENTS_DOCKER" \
@@ -1079,7 +1102,8 @@ docker_desktop_version ()
 	fi
 
 	if is_wsl; then
-		grep -Po '"Informational":.*?[^\\]"' '/mnt/c/Program Files/Docker/Docker/resources/componentsVersion.json' | cut -d : -f2 | awk -F\" '{print $2}'
+		# Query Windows registry for the "Docker Desktop" app "DisplayVersion"
+		powershell.exe 'Get-ItemPropertyValue "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop" DisplayVersion'
 	fi
 }
 
@@ -1477,32 +1501,32 @@ _vhost_proxy_connect ()
 # https://github.com/docksal/docksal/issues/225#issuecomment-306604063
 _healthcheck_wait ()
 {
-	local delay=5
-	local timeout=$DOCKSAL_HEALTHCHECK_TIMEOUT
+	local delay=5 # Delay (seconds) before rerunning the check
+	local timeout=${DOCKSAL_HEALTHCHECK_TIMEOUT} # Total time (seconds) before the healthcheck is considered failed
 	local elapsed=0
 	local status=""
-	local FILTER="label=com.docker.compose.project=$COMPOSE_PROJECT_NAME"
+	local FILTER="label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}"
 
 	sleep 1 # Small sleep to give quick containers time to start
-	status=$(docker ps --filter "$FILTER" --format '{{ .Status }}')
+	status=$(docker ps --filter "${FILTER}" --format '{{ .Status }}')
 
 	# While one or more containers are starting wait for them
-	while [[ "$status" =~ "(health: starting)" ]]; do
+	while [[ "${status}" =~ "(health: starting)" ]]; do
 		echo "Waiting for project stack to become ready..."
-		sleep "$delay";
+		sleep ${delay};
 		elapsed=$((elapsed + delay))
 		if ((elapsed > timeout)); then
 			echo-error "Project heathcheck has timed out" \
-				"One or more containers did not enter a healthy state within $timeout seconds of the project start." \
+				"One or more containers did not enter a healthy state within ${timeout} seconds of the project start." \
 				"See ${yellow}fin project status${NC} for details" \
 				"Check ${yellow}fin logs${NC} for more details"
 			return 1
 		fi
-		status=$(docker ps --filter "$FILTER" --format '{{ .Status }}')
+		status=$(docker ps --filter "${FILTER}" --format '{{ .Status }}')
 	done
 
-	# All contaners have started, check the final status
-	if [[ "$status" =~ "(health: unhealthy)" ]]; then
+	# All containers have started, check the final status
+	if [[ "${status}" =~ "(health: unhealthy)" ]]; then
 		echo-error "One or more containers are not healthy" \
 			"See ${yellow}fin project status${NC} for details"
 			"This is most likely due to a project misconfiguration."
@@ -1569,10 +1593,10 @@ show_help ()
 			fi
 	fi
 
+	echo "Docksal command line utility (v$FIN_VERSION)"
+	echo "Docksal docs: https://docs.docksal.io/"
 	echo
-	echo "Docksal command line utility v$FIN_VERSION"
-	echo
-	echo "Usage: fin <command>"
+	echo "Usage: fin [command]"
 	echo
 
 	echo-green "Management Commands:"
@@ -1627,7 +1651,7 @@ show_help ()
 	load_global_configuration
 	if ! empty_dir "$PROJECT_ROOT/$DOCKSAL_ADDONS_PATH" || ! empty_dir "$HOME/$DOCKSAL_ADDONS_PATH"; then
 		echo
-		echo-green "Addons:"
+		echo-green "Addons found:"
 	fi
 	if [[ ! -z "$(get_project_path)" ]]; then
 		show_help_list_addons_in_help 'project'
@@ -1639,7 +1663,7 @@ show_help ()
 	# Show list of custom commands and their help if available
 	if ! empty_dir "$PROJECT_ROOT/$DOCKSAL_COMMANDS_PATH" || ! empty_dir "$HOME/$DOCKSAL_COMMANDS_PATH"; then
 		echo
-		echo-green "Custom commands:"
+		echo-green "Custom commands found:"
 	fi
 	if [[ ! -z "$(get_project_path)" ]]; then
 		show_help_list_commands_in_help 'project'
@@ -1826,6 +1850,8 @@ show_help_project() {
 	printh "" "Drupal, Wordpress, Magento, Laravel, Backdrop, Hugo, Gatsby, and others"
 	printh "  --name=name" "Provide project name upfront"
 	printh "  --choice=#" "Provide software choice number upfront"
+	printh "  --repo=name" "Clone from a custom repo: name (--choice is set to '0' automatically)"
+	printh "  --branch=name" "Clone from a custom repo: branch name (optional)"
 	printh "  --yes (-y)" "Avoid confirmation"
 	echo
 	printh "config" "Show project configuration"
@@ -1878,7 +1904,7 @@ show_help_ssh-key() {
 	echo
 	echo "Examples:"
 	printh "fin ssh-key add" "Loads all SSH keys with default names: id_rsa/id_dsa/id_ecdsa from \$HOME/.ssh/"
-	printh "fin ssh-key server_rsa" "Loads the key stored in \$HOME/.ssh/server_id_rsa into the agent"
+	printh "fin ssh-key add server_rsa" "Loads the key stored in \$HOME/.ssh/server_id_rsa into the agent"
 	printh "fin ssh-key new server2_rsa" "Generates a new SSH key pair in ~/.ssh/server2_id_rsa"
 }
 
@@ -2628,6 +2654,13 @@ nfs_share_add ()
 	local new_exports=$(echo -e "$exports")
 	local old_exports=$(cat /etc/exports 2>/dev/null)
 	if [[ "$new_exports" != "$old_exports" ]]; then
+		# Ensure /etc/exports exists
+		# nfsd won't start or even do "checkexports" without the config file
+		if [[ ! -f /etc/exports ]]; then
+			sudo touch /etc/exports # This automatically triggers nfsd start
+			sleep 5 # Give nfsd site time to start
+		fi
+
 		# Write temporary exports file to /tmp/etc.exports.XXXXX and check it
 		local exports_test="/tmp/etc.exports.$RANDOM"
 		echo -e "$exports" | tee "$exports_test" >/dev/null
@@ -3180,8 +3213,11 @@ project_create ()
 
 	# Read repo from params if available
 	if [[ "$repo" != "" ]]; then
-		local target_repo="$repo"
 		local choice="0"
+		local target_repo="$repo"
+		# Read branch from params if available
+		local target_branch
+		[[ "$branch" != "" ]] && target_branch="$branch"
 	fi
 
 	# Determine project name
@@ -3259,12 +3295,12 @@ project_create ()
 		2)
 			target_cms="Drupal 9 (BLT Version)"
 			target_host_name_search_string="drupal9.docksal"
-			target_repo="$URL_REPO_DRUPAL9COMPOSER"
+			target_repo="$URL_REPO_DRUPAL9BLT"
 			;;
 		3)
-			target_cms="Drupal 9 (BLT Version)"
+			target_cms="Drupal 9"
 			target_host_name_search_string="drupal9.docksal"
-			target_repo="$URL_REPO_DRUPAL9BLT"
+			target_repo="$URL_REPO_DRUPAL9"
 			;;
 		4)
 			target_cms="Drupal 8"
@@ -3358,6 +3394,7 @@ project_create ()
 	echo -e "Project folder:   ${yellow}$(pwd)/$project_name${NC}"
 	echo -e "Project software: ${yellow}${target_cms}${NC}"
 	echo -e "Source repo:      ${yellow}${target_repo}${NC}"
+	echo -e "Source branch:    ${yellow}${target_branch:-<default>}${NC}"
 	echo -e "Project URL:      ${yellow}http://${project_virtual_host_name}${NC}"
 	echo
 
@@ -3377,8 +3414,10 @@ project_create ()
 	fi
 
 	echo -e "${green}Cloning repository...${NC}"
-	run_cli git clone -b master "${target_repo}" "${project_name}" --depth=1
-	[ ! $? -eq 0 ] && _confirm "Checkout finished with errors. Do you wish to continue?"
+	run_cli git clone \
+		$( [[ "${target_branch}" != "" ]] && echo "--branch=${target_branch}" ) \
+		"${target_repo}" "${project_name}" --depth=1 --no-tags
+	[[ $? != 0 ]] && _confirm "Checkout finished with errors. Do you wish to continue with project init?"
 
 	cd "${project_name}"
 
@@ -3934,8 +3973,9 @@ install_proxy_service ()
 		--mount type=volume,src=docksal_projects,dst=/projects \
 		--mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
 		${mount_certs} \
-        	--log-opt max-size=${DOCKSAL_CONTAINER_LOG_MAX_SIZE} \
-        	--log-opt max-file=${DOCKSAL_CONTAINER_LOG_MAX_FILE} \
+		--log-opt max-size=${DOCKSAL_CONTAINER_LOG_MAX_SIZE} \
+		--log-opt max-file=${DOCKSAL_CONTAINER_LOG_MAX_FILE} \
+		--health-interval=${DOCKSAL_CONTAINER_HEALTHCHECK_INTERVAL} \
 		"${IMAGE_VHOST_PROXY}" >/dev/null
 	if_failed_error "Failed starting the proxy service."
 }
@@ -4025,6 +4065,9 @@ install_dns_service ()
 		-p "${DOCKSAL_DNS_IP:-$DOCKSAL_IP}:53:53/udp" --cap-add=NET_ADMIN --dns="$DOCKSAL_DNS_UPSTREAM" --dns="9.9.9.9" \
 		-e DNS_IP="$DOCKSAL_IP" -e DNS_DOMAIN="$DOCKSAL_DNS_DOMAIN" -e LOG_QUERIES="$DOCKSAL_DNS_DEBUG" \
 		--mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
+		--log-opt max-size=${DOCKSAL_CONTAINER_LOG_MAX_SIZE} \
+		--log-opt max-file=${DOCKSAL_CONTAINER_LOG_MAX_FILE} \
+		--health-interval=${DOCKSAL_CONTAINER_HEALTHCHECK_INTERVAL} \
 		"${IMAGE_DNS}" >/dev/null
 	if_failed_error "Failed starting the DNS service."
 }
@@ -4049,8 +4092,11 @@ configure_resolver_mac () {
 
 	# Flush DNS cache
 	echo-green "Clearing DNS cache..."
-	sudo dscacheutil -flushcache
-	# to check: scutil --dns
+	# On macOS clearing DNS cache is a bit tricky and needs to be done in several places.
+	# Note: sometimes neither is needed, other times - one or both.
+	sudo dscacheutil -flushcache # Flush DNS cache
+	sudo killall -HUP mDNSResponder # Reload mDNSResponder config
+	# to check: run "scutil --dns" and look for the "docksal" domain resolver at the bottom of the list.
 }
 
 # Configure system-wide *.docksal resolver via /etc/resolv.conf on Alpine
@@ -4212,6 +4258,9 @@ install_sshagent_service ()
 	docker volume create --name docksal_ssh_agent >/dev/null 2>&1
 	docker run -d --name docksal-ssh-agent --label "io.docksal.group=system" --restart=unless-stopped \
 		--mount type=volume,src=docksal_ssh_agent,dst=/.ssh-agent \
+		--log-opt max-size=${DOCKSAL_CONTAINER_LOG_MAX_SIZE} \
+		--log-opt max-file=${DOCKSAL_CONTAINER_LOG_MAX_FILE} \
+		--health-interval=${DOCKSAL_CONTAINER_HEALTHCHECK_INTERVAL} \
 		"${IMAGE_SSH_AGENT}" $ssh_service_args >/dev/null
 	if_failed_error "Failed starting the SSH agent service."
 
@@ -4785,6 +4834,7 @@ update_tools ()
 update_config_files ()
 {
 	files_to_download="
+			$STACKS_OVERRIDES_DD_BIND
 			$STACKS_OVERRIDES_IDE
 			$STACKS_OVERRIDES_XHPROF
 			$STACKS_SERVICES
@@ -5478,8 +5528,12 @@ _mysql ()
 	if is_tty || [[ -z "${ARGV[*]}" ]]; then
 		__pty_command="${winpty}"
 	fi
+	local __pty_alloc=''
+	if is_tty; then
+		__pty_alloc='-t'
+	fi
 
-	${__pty_command} docker exec -it "${container_id}" mysql \
+	${__pty_command} docker exec -i ${__pty_alloc} "${container_id}" mysql \
 		-u"${__dump_user}" \
 		-p"${__dump_password}" \
 		${__database} \
@@ -5899,6 +5953,11 @@ sysinfo ()
 {
 	eval $(parse_params "$@")
 
+	echo
+	echo "███  FIN" &&
+	version
+
+	echo
 	echo "███  OS"
 	# OS version
 	echo "${OS_TYPE} ${OS_NAME} ${OS_VERSION}"
@@ -5916,23 +5975,13 @@ sysinfo ()
 		echo "VirtualBox VM"
 	fi
 
-	if ! is_docker_native; then
-		echo "DOCKER_HOST : $DOCKER_HOST"
-		is_mac && echo "DOCKSAL_NFS_PATH : $DOCKSAL_NFS_PATH"
-		if is_mac; then
-			echo "NFS EXPORTS:"
-			cat /etc/exports
-		fi
+	echo "DOCKER_HOST : $DOCKER_HOST"
+	if is_mac; then
+		echo "DOCKSAL_NFS_PATH : $DOCKSAL_NFS_PATH"
+		echo
+		echo "NFS EXPORTS:"
+		cat /etc/exports
 	fi
-
-	echo
-	echo "███  FIN" &&
-	version
-
-	echo
-	echo "███  DOCKER COMPOSE"
-	echo "EXPECTED VERSION: $REQUIREMENTS_DOCKER_COMPOSE"
-	docker-compose version
 
 	echo
 	echo "███  DOCKER"
@@ -5946,6 +5995,11 @@ sysinfo ()
 	fi
 	echo
 	docker version
+
+	echo
+	echo "███  DOCKER COMPOSE"
+	echo "EXPECTED VERSION: $REQUIREMENTS_DOCKER_COMPOSE"
+	docker-compose version
 
 	if [[ "$all" == "all" ]]; then
 		echo
@@ -5976,7 +6030,7 @@ sysinfo ()
 	if is_docker_running; then
 		echo
 		echo "███  DOCKSAL: PROJECTS"
-		project_list
+		project_list --all
 
 		echo
 		echo "███  DOCKSAL: VIRTUAL HOSTS"
@@ -5986,22 +6040,58 @@ sysinfo ()
 		echo "███  DOCKSAL: NETWORKING"
 		echo
 		echo "DOCKSAL_IP: ${DOCKSAL_IP}"
+		echo "DOCKSAL_HOST_IP: ${DOCKSAL_HOST_IP}"
 		echo "DOCKSAL_VHOST_PROXY_IP: ${DOCKSAL_VHOST_PROXY_IP}"
 		echo "DOCKSAL_DNS_IP: ${DOCKSAL_DNS_IP}"
 		echo "DOCKSAL_DNS_DISABLED: ${DOCKSAL_DNS_DISABLED}"
 		echo "DOCKSAL_NO_DNS_RESOLVER: ${DOCKSAL_NO_DNS_RESOLVER}"
 		echo "DOCKSAL_DNS_UPSTREAM: ${DOCKSAL_DNS_UPSTREAM}"
 		echo "DOCKSAL_DNS_DOMAIN: ${DOCKSAL_DNS_DOMAIN}"
+
+		# Host <> Containers connectivity
 		echo
-		TEST_URL="http://dns-test.${DOCKSAL_DNS_DOMAIN}"
+		echo "███  DOCKSAL: CONNECTIVITY"
+		echo
+		## Check that host can access DOCKSAL_IP
+		# Options that work cross-platform: "-c 1" - one request, "-W 1" - wait up to 1s for the first request
+		local PING="ping -c 1 -W 1"
+		echo -n "Host to ${DOCKSAL_IP}: 	"
+		eval "${PING} ${DOCKSAL_IP}" &>/dev/null
+		[[ $? == 0 ]] && echo "PASS" || echo "FAIL"
+		## Check that containers can access DOCKSAL_IP
+		echo -n "Container to ${DOCKSAL_IP}: 	"
+		docker run --rm busybox sh -c "${PING} ${DOCKSAL_IP}" &>/dev/null
+		[[ $? == 0 ]] && echo "PASS" || echo "FAIL"
+		## Check that containers can access DOCKSAL_HOST_IP
+		echo -n "Container to ${DOCKSAL_HOST_IP}: 	"
+		docker run --rm busybox sh -c "${PING} ${DOCKSAL_HOST_IP}" &>/dev/null
+		[[ $? == 0 ]] && echo "PASS" || echo "FAIL"
+
+		# DNS resolution
+		local TEST_URL="http://dns-test.${DOCKSAL_DNS_DOMAIN}"
 		#TEST_CMD="wget -O- ${TEST_URL} &>/dev/null"  # Does not work correctly with Alpine's buysbox/wget
-		TEST_CMD="curl --connect-timeout 2 -sS ${TEST_URL}"
+		local TEST_CMD="curl --connect-timeout 2 -sS ${TEST_URL}"
+		echo
 		echo "Checking connectivity to ${TEST_URL}..."
-		# Test DNS resolution on the host
+		## Test DNS resolution on the host
 		echo -n "Host: "
 		eval ${TEST_CMD} &>/dev/null
-		[[ $? == 0 ]] && echo "PASS" || echo "FAIL"
-		# Test DNS resolution in a container
+		if [[ $? == 0 ]]; then
+			echo "PASS"
+		else
+			echo "FAIL"
+			echo
+			echo "Debug info:"
+			echo "----------"
+			set -x
+			cat /etc/resolv.conf | grep ${DOCKSAL_IP}
+			ping -c 1 -W 1 dns-test.docksal
+			nslookup -timeout=1 dns-test.docksal ${DOCKSAL_IP}
+			set +x
+			echo "----------"
+			echo
+		fi
+		## Test DNS resolution in a container
 		echo -n "Containers: "
 		# TODO: figure out how to use busybox/wget in docksal/empty or use our own version with full wget/curl instead
 		docker run --rm --dns="${DOCKSAL_DNS1}" --dns="${DOCKSAL_DNS2}" curlimages/curl sh -c "${TEST_CMD}" &>/dev/null
@@ -6201,7 +6291,7 @@ load_configuration ()
 			[[ -f "$local_yml_file" ]] && COMPOSE_FILE="${COMPOSE_FILE}${SEPARATOR}${local_yml_file}"
 		fi
 
-		# Include a volumes yml if requested. Use bind mount for volumes by default.
+		# Include a volumes yml if requested. Use bind mount volumes by default.
 		if is_mac; then
 			# Default to NFS volumes on Mac (both VirtualBox and Docker Desktop)
 			DOCKSAL_VOLUMES=${DOCKSAL_VOLUMES:-nfs}
@@ -6209,7 +6299,7 @@ load_configuration ()
 			# Bind mounted volumes on all other systems
 			DOCKSAL_VOLUMES=${DOCKSAL_VOLUMES:-bind}
 		fi
-		if [[ "$DOCKSAL_VOLUMES" != "disable" ]]; then
+		if [[ "$DOCKSAL_VOLUMES" != "disabled" ]]; then
 			volumes_yml_file="$(get_config_dir_dc)/stacks/volumes-$DOCKSAL_VOLUMES.yml"
 			if [[ -f "$volumes_yml_file" ]]; then
 				COMPOSE_FILE="${volumes_yml_file}${SEPARATOR}${COMPOSE_FILE}"
@@ -6222,12 +6312,24 @@ load_configuration ()
 		fi
 		export DOCKSAL_VOLUMES
 
+		# Fix bind volumes on Docker Desktop v2.3.0.2+
+		# See https://github.com/docksal/docksal/issues/1368
+		overrides_dd_bind_file="$(get_config_dir_dc)/stacks/overrides-dd-bind.yml"
+		if [[ -f "${overrides_dd_bind_file}" ]] && \
+			is_docker_native && \
+			(( $(ver_to_int $(docker_desktop_version)) >= $(ver_to_int '2.3.0.2') )) && \
+			[[ "$DOCKSAL_VOLUMES" == "bind" ]];
+		then
+			COMPOSE_FILE="${COMPOSE_FILE}${SEPARATOR}${overrides_dd_bind_file}"
+		fi
+
 		# Enable VSCode (Coder) IDE
 		overrides_ide_file="$(get_config_dir_dc)/stacks/overrides-ide.yml"
 		if [[ -f "${overrides_ide_file}" ]] && [[ "$IDE_ENABLED" != "" ]] && [[ "$IDE_ENABLED" != "0" ]]; then
 			COMPOSE_FILE="${COMPOSE_FILE}${SEPARATOR}${overrides_ide_file}"
 		fi
 
+		# Enable xhprof integration
 		overrides_xhprof_file="$(get_config_dir_dc)/stacks/overrides-xhprof.yml"
 		if [[ -f "${overrides_xhprof_file}" ]] && [[ "$XHPROF_ENABLED" != "" ]] && [[ "$XHPROF_ENABLED" != "0" ]]; then
 			COMPOSE_FILE="${COMPOSE_FILE}${SEPARATOR}${overrides_xhprof_file}"
@@ -7881,6 +7983,9 @@ export MYSQL_DATABASE=${MYSQL_DATABASE:-default}
 # Container logging settings
 export DOCKSAL_CONTAINER_LOG_MAX_SIZE
 export DOCKSAL_CONTAINER_LOG_MAX_FILE
+
+# Container healthcheck settings
+export DOCKSAL_CONTAINER_HEALTHCHECK_INTERVAL
 
 # Handle Alias
 if [[ "$1" == "@"* ]]; then
